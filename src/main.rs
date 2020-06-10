@@ -24,7 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Based on https://github.com/cloudflare/quiche/blob/0.4.0/examples/client.rs
+// Based on https://github.com/cloudflare/quiche/blob/0.4.0/examples/http3-client.rs
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -32,23 +32,23 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::Instant;
 
+use anyhow::{anyhow, Context, Error};
 use ring::rand::*;
 use url::Url;
 
-type Error = Box<dyn std::error::Error>;
 type Scid = [u8; quiche::MAX_CONN_ID_LEN];
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const HTTP_REQ_STREAM_ID: u64 = 4;
 
 fn main() -> Result<(), Error> {
-    let url = Url::parse("https://quic.tech:4433/")?;
+    let url = Url::parse("https://quic.tech:8443/")?;
 
     let peer_addr = url
         .socket_addrs(|| None)?
         .into_iter()
         .next()
-        .ok_or("Failed to resolve remote address")?;
+        .ok_or_else(|| anyhow!("Failed to resolve remote address"))?;
     let bind_addr = match peer_addr {
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
@@ -59,7 +59,7 @@ fn main() -> Result<(), Error> {
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.verify_peer(false);
-    config.set_application_protos(b"\x05hq-27\x08http/0.9")?;
+    config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
     config.set_max_idle_timeout(5000);
     config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
     config.set_initial_max_data(10_000_000);
@@ -68,6 +68,8 @@ fn main() -> Result<(), Error> {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
+
+    let mut http3_conn = None;
 
     let scid = new_scid()?;
     let mut conn = quiche::connect(url.domain(), &scid, &mut config)?;
@@ -80,11 +82,13 @@ fn main() -> Result<(), Error> {
     );
 
     let mut out = [0; MAX_DATAGRAM_SIZE];
-    let write = conn.send(&mut out)?;
-    socket.send(&out[..write])?;
+    let write = conn.send(&mut out).context("initial send failed")?;
+    socket.send(&out[..write]).context("initial send failed")?;
 
     println!("written {}", write);
 
+    let h3_config = quiche::h3::Config::new()?;
+    let req = prepare_request(&url);
     let req_start = Instant::now();
     let mut req_sent = false;
 
@@ -126,37 +130,59 @@ fn main() -> Result<(), Error> {
             break;
         }
 
-        if conn.is_established() && !req_sent {
+        // Create a new HTTP/3 connection once the QUIC connection is established.
+        if conn.is_established() && http3_conn.is_none() {
+            http3_conn = Some(quiche::h3::Connection::with_transport(
+                &mut conn, &h3_config,
+            )?);
+        }
+
+        if let (Some(h3_conn), false) = (&mut http3_conn, req_sent) {
             println!("sending HTTP request for {}", url.path());
-
-            let req = format!("GET {}\r\n", url.path());
-            conn.stream_send(HTTP_REQ_STREAM_ID, req.as_bytes(), true)?;
-
+            h3_conn.send_request(&mut conn, &req, true)?;
             req_sent = true;
         }
 
-        let mut buf = [0; 65536];
-        for s in conn.readable() {
-            while let Ok((read, fin)) = conn.stream_recv(s, &mut buf) {
-                println!("received {} bytes", read);
+        if let Some(http3_conn) = &mut http3_conn {
+            let mut buf = [0; 65536];
 
-                let stream_buf = &buf[..read];
+            // Process HTTP/3 events.
+            loop {
+                match http3_conn.poll(&mut conn) {
+                    Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                        println!("got response headers {:?} on stream id {}", list, stream_id);
+                    }
 
-                println!("stream {} has {} bytes (fin? {})", s, stream_buf.len(), fin);
+                    Ok((stream_id, quiche::h3::Event::Data)) => {
+                        if let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
+                            println!(
+                                "got {} bytes of response data on stream {}",
+                                read, stream_id
+                            );
 
-                print!("Content: {}", unsafe {
-                    std::str::from_utf8_unchecked(&stream_buf)
-                });
+                            print!("{}", unsafe { std::str::from_utf8_unchecked(&buf[..read]) });
+                        }
+                    }
 
-                // The server reported that it has no more data to send, which
-                // we got the full response. Close the connection.
-                if s == HTTP_REQ_STREAM_ID && fin {
-                    println!("response received in {:?}, closing...", req_start.elapsed());
+                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                        println!("response received in {:?}, closing...", req_start.elapsed());
 
-                    conn.close(true, 0x00, b"kthxbye").unwrap();
+                        conn.close(true, 0x00, b"kthxbye").unwrap();
+                    }
+
+                    Err(quiche::h3::Error::Done) => {
+                        break;
+                    }
+
+                    Err(e) => {
+                        eprintln!("HTTP/3 processing failed: {:?}", e);
+
+                        break;
+                    }
                 }
             }
         }
+
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
         loop {
@@ -192,14 +218,36 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
+fn prepare_request(url: &Url) -> Vec<quiche::h3::Header> {
+    use quiche::h3::Header;
+    use url::Position;
+
+    vec![
+        Header::new(":method", "GET"),
+        Header::new(":scheme", url.scheme()),
+        Header::new(
+            ":authority",
+            &url[Position::BeforeUsername..Position::AfterPort],
+        ),
+        Header::new(":path", &url[Position::BeforePath..Position::AfterQuery]),
+        Header::new("user-agent", "quiche"),
+    ]
+}
+
 fn recv_loop(socket: &UdpSocket, tx: SyncSender<Vec<u8>>) {
     loop {
         let mut buf = vec![0; 65536];
-        let len = socket.recv(&mut buf).unwrap();
+        let len = match socket.recv(&mut buf) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("recv failed: {}", e);
+                return;
+            }
+        };
         buf.truncate(len);
         if let Err(_) = tx.send(buf) {
             println!("channel closed");
-            break;
+            return;
         }
     }
 }
@@ -208,7 +256,7 @@ fn new_scid() -> Result<Scid, Error> {
     let mut scid = Scid::default();
     SystemRandom::new()
         .fill(&mut scid[..])
-        .map_err(|_| "crypto error")?;
+        .map_err(|_| anyhow!("crypto error"))?;
     Ok(scid)
 }
 
