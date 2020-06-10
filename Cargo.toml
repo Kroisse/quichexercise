@@ -1,0 +1,12 @@
+[package]
+name = "quichexercise"
+version = "0.1.0"
+authors = ["Eunchong Yu <kroisse@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+quiche = "0.4"
+ring = "0.16"
+url = "2.1"
