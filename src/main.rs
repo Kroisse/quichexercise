@@ -26,23 +26,26 @@
 
 // Based on https://github.com/cloudflare/quiche/blob/0.4.0/examples/http3-client.rs
 
-use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::thread;
+#![warn(clippy::all, clippy::pedantic)]
+
+mod util;
+
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Error};
-use ring::rand::*;
+use async_std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+};
 use url::Url;
 
-type Scid = [u8; quiche::MAX_CONN_ID_LEN];
+use crate::util::{new_scid, HexDump};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const HTTP_REQ_STREAM_ID: u64 = 4;
 
-fn main() -> Result<(), Error> {
-    let url = Url::parse("https://quic.tech:8443/")?;
+#[async_std::main]
+async fn main() -> Result<(), Error> {
+    let url = Url::parse("https://www.google.com/")?;
 
     let peer_addr = url
         .socket_addrs(|| None)?
@@ -54,8 +57,8 @@ fn main() -> Result<(), Error> {
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
 
-    let socket = UdpSocket::bind(bind_addr)?;
-    socket.connect(peer_addr)?;
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(peer_addr).await?;
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.verify_peer(false);
@@ -78,12 +81,15 @@ fn main() -> Result<(), Error> {
         "connecting to {:} from {:} with scid {}",
         peer_addr,
         socket.local_addr()?,
-        HexDump(&scid),
+        HexDump::from(&scid[..]),
     );
 
     let mut out = [0; MAX_DATAGRAM_SIZE];
     let write = conn.send(&mut out).context("initial send failed")?;
-    socket.send(&out[..write]).context("initial send failed")?;
+    socket
+        .send(&out[..write])
+        .await
+        .context("initial send failed")?;
 
     println!("written {}", write);
 
@@ -92,21 +98,18 @@ fn main() -> Result<(), Error> {
     let req_start = Instant::now();
     let mut req_sent = false;
 
-    let (tx, rx) = mpsc::sync_channel(0);
-    thread::spawn({
-        let socket = socket.try_clone()?;
-        move || recv_loop(&socket, tx)
-    });
+    let mut buf = [0; 65536];
 
     loop {
+        let recv = socket.recv(&mut buf);
         let res = match conn.timeout() {
-            Some(timeout) => rx.recv_timeout(timeout),
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(d) => async_std::io::timeout(d, recv).await,
+            None => recv.await,
         };
 
         match res {
-            Ok(mut buf) => {
-                let read = match conn.recv(&mut buf[..]) {
+            Ok(len) => {
+                let read = match conn.recv(&mut buf[..len]) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("recv failed: {}", e);
@@ -115,12 +118,13 @@ fn main() -> Result<(), Error> {
                 };
                 println!("processed bytes: {}", read);
             }
-            Err(RecvTimeoutError::Timeout) => {
-                println!("timed out");
-                conn.on_timeout();
-            }
             Err(e) => {
-                panic!(e);
+                if let io::ErrorKind::TimedOut = e.kind() {
+                    println!("timed out");
+                    conn.on_timeout();
+                } else {
+                    panic!(e);
+                }
             }
         };
         println!("done reading");
@@ -144,8 +148,6 @@ fn main() -> Result<(), Error> {
         }
 
         if let Some(http3_conn) = &mut http3_conn {
-            let mut buf = [0; 65536];
-
             // Process HTTP/3 events.
             loop {
                 match http3_conn.poll(&mut conn) {
@@ -202,7 +204,7 @@ fn main() -> Result<(), Error> {
                 }
             };
 
-            if let Err(e) = socket.send(&out[..write]) {
+            if let Err(e) = socket.send(&out[..write]).await {
                 panic!("send() failed: {:?}", e);
             }
 
@@ -232,41 +234,4 @@ fn prepare_request(url: &Url) -> Vec<quiche::h3::Header> {
         Header::new(":path", &url[Position::BeforePath..Position::AfterQuery]),
         Header::new("user-agent", "quiche"),
     ]
-}
-
-fn recv_loop(socket: &UdpSocket, tx: SyncSender<Vec<u8>>) {
-    loop {
-        let mut buf = vec![0; 65536];
-        let len = match socket.recv(&mut buf) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("recv failed: {}", e);
-                return;
-            }
-        };
-        buf.truncate(len);
-        if let Err(_) = tx.send(buf) {
-            println!("channel closed");
-            return;
-        }
-    }
-}
-
-fn new_scid() -> Result<Scid, Error> {
-    let mut scid = Scid::default();
-    SystemRandom::new()
-        .fill(&mut scid[..])
-        .map_err(|_| anyhow!("crypto error"))?;
-    Ok(scid)
-}
-
-struct HexDump<'a>(&'a [u8]);
-
-impl fmt::Display for HexDump<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in self.0 {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
-    }
 }
